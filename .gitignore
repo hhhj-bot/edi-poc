@@ -1,0 +1,16 @@
+node_modules/
+dist/
+.next/
+*.log
+
+# 환경변수 · 자격증명 — 절대 커밋 금지
+.env
+.env.local
+.env.*.local
+
+# Kafka 로컬 데이터
+kafka-data/
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,111 @@
+# EDI/API 모니터링 — 로컬 인프라
+#
+# 1단계: Kafka(KRaft 단일 노드) + Kafka UI + 토픽 생성까지.
+# Postgres 는 4단계에서 붙인다. 지금은 "메시지가 흐르는 것"만 본다.
+#
+#   docker compose up -d
+#   → http://localhost:8080  (Kafka UI)
+#
+# ──────────────────────────────────────────────────────────────
+# 리스너가 둘인 이유 (여기가 Kafka 로컬 셋업의 제일 흔한 함정)
+#
+#   HOST   localhost:9092   호스트에서 도는 앱(Nest.js·테스트)이 붙는 주소
+#   DOCKER kafka:19092      같은 compose 망의 컨테이너(Kafka UI)가 붙는 주소
+#
+# 하나만 두고 advertised 를 localhost 로 하면 Kafka UI 가 못 붙는다 —
+# UI 컨테이너 안의 localhost 는 자기 자신이기 때문이다.
+# 브로커는 접속해 온 리스너에 맞는 주소를 "너는 여기로 와라"고 돌려주므로
+# 접근 경로마다 리스너를 따로 둔다.
+# ──────────────────────────────────────────────────────────────
+
+services:
+  kafka:
+    image: apache/kafka:4.0.0
+    container_name: edi-kafka
+    ports:
+      - "9092:9092"        # 호스트에서 접속
+    environment:
+      # --- KRaft: 브로커와 컨트롤러를 한 프로세스가 겸한다 (ZooKeeper 없음) ---
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+
+      # --- 리스너 3종: 호스트용 · 컨테이너용 · 컨트롤러용 ---
+      KAFKA_LISTENERS: HOST://0.0.0.0:9092,DOCKER://0.0.0.0:19092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: HOST://localhost:9092,DOCKER://kafka:19092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: HOST:PLAINTEXT,DOCKER:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: DOCKER
+
+      # --- 단일 브로커라 복제본은 전부 1 ---
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+      KAFKA_MIN_INSYNC_REPLICAS: 1
+
+      # 컨슈머 그룹이 즉시 뜨게 (운영에선 기본값 3000ms 를 쓴다)
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+
+      # 토픽을 명시적으로 만들 것이므로 자동 생성은 끈다.
+      # 오타 난 토픽명이 조용히 생겨 디버깅을 어렵게 하는 걸 막는다.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+      start_period: 15s
+
+  # 브로커가 뜬 뒤 토픽을 만들고 끝나는 1회성 컨테이너.
+  # 토픽 구성을 코드로 남겨 두는 것이 목적이다 — 손으로 만들면 기록이 안 남는다.
+  topics-init:
+    image: apache/kafka:4.0.0
+    container_name: edi-topics-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        K=/opt/kafka/bin/kafka-topics.sh
+        B=kafka:19092
+
+        create() {
+          $$K --bootstrap-server $$B --create --if-not-exists \
+              --topic "$$1" --partitions "$$2" --replication-factor 1 \
+              --config retention.ms="$$3"
+          echo "  ✓ $$1 (파티션 $$2)"
+        }
+
+        echo "토픽 생성..."
+        #     토픽                파티션  보존기간
+        create edi.inbound          3   604800000    # 7일  수신 원문
+        create edi.parsed           3   604800000    # 7일  파싱 성공
+        create edi.dlq              1  2592000000    # 30일 실패 — 재처리 대상이라 길게, 순서 보려고 1파티션
+        create edi.status           3   604800000    # 7일  처리 상태 이벤트
+        create as2.transmission     3   604800000    # 7일  AS2 전송 시도
+        create as2.mdn              3   604800000    # 7일  AS2 수신확인
+
+        echo
+        echo "현재 토픽:"
+        $$K --bootstrap-server $$B --list
+
+  kafka-ui:
+    image: ghcr.io/kafbat/kafka-ui:latest
+    container_name: edi-kafka-ui
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: edi-local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:19092   # ← DOCKER 리스너로 붙는다
+      DYNAMIC_CONFIG_ENABLED: "true"
+
+volumes:
+  kafka-data:
